@@ -6,23 +6,23 @@ from nonebot.adapters import Message
 from nonebot.params import CommandArg
 # from fastapi import FastAPI
 import httpx
-import json
-from nonebot import logger
 from functools import lru_cache
-# from src.plugins.weather.NowWeatherResponse import Now, WeatherResponse, Refer
-from ..weather.NowWeatherResponse import Now, WeatherResponse, Refer
-from ..weather.LocationResponse import LocationResponse, Location, Refer
+# from src.plugins.weather.NowWeatherResponse import WeatherResponse, Refer
+from ..weather.NowWeatherResponse import WeatherResponse
+from ..weather.LocationResponse import LocationResponse
 from .config import Config
-import time
+import redis
 
 __plugin_meta__ = PluginMetadata(
     name="weather",
-    description="",
-    usage="",
+    description="使用和风天气接口查询天气",
+    usage="帮助用户了解天气状况",
     config=Config,
 )
 
-plugin_config = get_plugin_config(Config)
+config = get_plugin_config(Config)
+
+rc = redis.Redis(host=config.redis_host, port=config.redis_port, decode_responses=True)
 
 # 实时天气接口
 NOW_WEATHER_URL: str = "https://devapi.qweather.com/v7/weather/now"
@@ -30,10 +30,9 @@ NOW_WEATHER_URL: str = "https://devapi.qweather.com/v7/weather/now"
 # 城市搜索接口
 LOCATION_SEARCH_URL: str = "https://geoapi.qweather.com/v2/city/lookup"
 
-# 初始化本地缓存字典
-cache = {}
+ERROR_MESSAGE: str = "😯天气服务出错了，请晚点再尝试"
 
-weather = on_command("天气", rule=to_me(), aliases={"查天气"}, priority=10, block=True)
+weather = on_command("天气", rule=to_me(), priority=10, block=True)
 
 @weather.handle()
 # 定义协程函数 handle_function，传入一个类型为Message的参数
@@ -44,9 +43,9 @@ async def handle_function(args: Message = CommandArg()):
     if location := args.extract_plain_text():
         try:
             async with httpx.AsyncClient() as client:
-                print(1)
                 location_id = await get_location_id(client, location)
-                print(2)
+                if location_id is None:
+                    await weather.finish("请尝试输入正确的市级城市名称或者反馈问题")
                 weather_info = await get_weather_info(client, location_id)
                 await weather.send(
 f"""{location}
@@ -65,88 +64,46 @@ f"""{location}
                 )
         except Exception as e:
             print(f"request weahter api fail \n{e}")
-            await weather.finish("😯天气服务出错了，请晚点再尝试")
+            await weather.finish(ERROR_MESSAGE)
     else:
         await weather.finish("请输入地名，例如：\n@bot 天气 北京")
 
 # 搜索城市获取id
 async def get_location_id(client: httpx.AsyncClient, location: str):
         cache_suffix = "_id"
-        if location_id := cache_get(location + cache_suffix):
+        if location_id := rc.get(location + cache_suffix):
             return location_id
         else:
-            response = await client.get(LOCATION_SEARCH_URL, params = {
-                "key": plugin_config.weather_api_key,
-                "location": location,
-            })
-            # response_text = json.loads(response.text)
-            print(f"[和风天气-城市搜索]响应数据：{response.text}")
-            # 使用 Pydantic 模型直接解析 JSON 数据
-            location_response = LocationResponse.parse_raw(response.text)
-            location_id = location_response.location[0].id
-            cache_set(location + cache_suffix, location_id, -1)
-            return location_id
-
+            try:
+                response = await client.get(LOCATION_SEARCH_URL, params = {
+                    "key": config.weather_api_key,
+                    "location": location,
+                })
+                print(f"[和风天气-城市搜索]响应数据：{response.text}")
+                # 使用 Pydantic 模型直接解析 JSON 数据
+                location_response = LocationResponse.parse_raw(response.text)
+                location_id = location_response.location[0].id
+                rc.set(location + cache_suffix, location_id)
+                return location_id
+            except Exception as e:
+                print(f"[和风天气-城市搜索]request fail \n{e}")
+                await weather.finish(ERROR_MESSAGE)
 
 # 获取天气数据
 async def get_weather_info(client: httpx.AsyncClient, location_id: str):
-    if response_txt := cache_get(location_id):
+    if response_txt := rc.get(location_id):
         weather_response = WeatherResponse.parse_raw(response_txt)
         return weather_response
     else:
-        response = await client.get(NOW_WEATHER_URL, params = {
-            "key": plugin_config.weather_api_key,
-            "location": location_id
-        })
-        # 看起来是写法错误，实际应该是response.text，写成了response.text()
-        # response_txt = json.loads(response.text)
-        print(f"[和风天气-实时天气]响应数据：{response.text}")
-        cache_set(location_id, response.text, 3600)
-        weather_response = WeatherResponse.parse_raw(response.text)
-        return weather_response
-
-# 缓存数据
-def cache_set(key, value, ttl=60):
-    """
-    设置缓存数据
-    :param key: 缓存的键
-    :param value: 缓存的值
-    :param ttl: 有效时间（秒）
-    """
-    cache[key] = {
-        "value": value,
-        "timestamp": time.time(),  # 当前时间戳
-        "ttl": ttl
-    }
-    print(f"已缓存{ttl}:{key}-{value}")
-
-# 获取缓存数据
-def cache_get(key):
-    """
-    获取缓存数据，如果过期则返回 None
-    :param key: 缓存的键
-    :return: 缓存的值或 None
-    """
-    print(f"获取缓存key{key}")
-    if key in cache:
-        entry = cache[key]
-        current_time = time.time()
-        # 检查是否过期，ttl < 0 表示永久缓存
-        if entry["ttl"] < 0 or current_time - entry["timestamp"] <= entry["ttl"]:
-            print(f"拿到缓存cache{cache}")
-            return entry["value"]
-        else:
-            # 删除过期数据
-            del cache[key]
-    return None
-
-# 清理过期缓存
-def cache_clean():
-    """
-    清理所有过期的缓存条目
-    """
-    current_time = time.time()
-    keys_to_delete = [key for key, entry in cache.items() 
-                      if entry["ttl"] >= 0 and current_time - entry["timestamp"] > entry["ttl"]]
-    for key in keys_to_delete:
-        del cache[key]
+        try:
+            response = await client.get(NOW_WEATHER_URL, params = {
+                "key": config.weather_api_key,
+                "location": location_id
+            })
+            print(f"[和风天气-实时天气]响应数据：{response.text}")
+            rc.set(location_id, response.text, 3600)
+            weather_response = WeatherResponse.parse_raw(response.text)
+            return weather_response
+        except Exception as e:
+            print(f"[和风天气-实时天气]request fail \n{e}")
+            await weather.finish(ERROR_MESSAGE)
